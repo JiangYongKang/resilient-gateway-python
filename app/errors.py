@@ -19,6 +19,8 @@ class ErrorCategory(str, Enum):
     NON_IDEMPOTENT_RETRY_FORBIDDEN = "non_idempotent_retry_forbidden"
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
     CIRCUIT_OPEN = "circuit_open"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    CONCURRENCY_LIMIT_EXCEEDED = "concurrency_limit_exceeded"
     INTERNAL = "internal"
 
 
@@ -32,6 +34,8 @@ PUBLIC_MESSAGES: dict[ErrorCategory, str] = {
     ErrorCategory.NON_IDEMPOTENT_RETRY_FORBIDDEN: "retry is forbidden for non-idempotent request without idempotency key",
     ErrorCategory.IDEMPOTENCY_CONFLICT: "a request with the same idempotency key is already being processed",
     ErrorCategory.CIRCUIT_OPEN: "upstream circuit breaker is open, serving degraded result",
+    ErrorCategory.BUDGET_EXHAUSTED: "request time budget exhausted, serving degraded result",
+    ErrorCategory.CONCURRENCY_LIMIT_EXCEEDED: "upstream concurrency limit reached, request rejected",
     ErrorCategory.INTERNAL: "internal server error",
 }
 

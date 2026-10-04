@@ -21,3 +21,20 @@ class RetryConfig:
     max_attempts: int = 3
     backoff_base_seconds: float = 0.01
     backoff_max_seconds: float = 1.0
+
+
+@dataclass(frozen=True)
+class BulkheadConfig:
+    """按上游维度的并发隔离（舱壁）配置。
+
+    * ``default_max_concurrent``：未单独配置的上游使用的默认最大在途请求数；
+    * ``per_upstream``：按上游名覆盖默认值。
+    """
+
+    default_max_concurrent: int = 32
+    per_upstream: dict[str, int] | None = None
+
+    def limit_for(self, upstream: str) -> int:
+        if self.per_upstream and upstream in self.per_upstream:
+            return self.per_upstream[upstream]
+        return self.default_max_concurrent

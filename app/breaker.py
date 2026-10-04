@@ -62,6 +62,12 @@ class CircuitBreaker:
             self._maybe_advance()
             return self._state
 
+    def failure_count(self) -> int:
+        """当前失败窗口内累计的失败数（先滑出过期记录再计数）。"""
+        with self._lock:
+            self._prune_failures()
+            return len(self._failure_times)
+
     def allow_request(self) -> bool:
         """是否允许一个请求通过熔断器。
 
@@ -173,6 +179,11 @@ class BreakerRegistry:
     def all_states(self) -> dict[str, BreakerState]:
         with self._lock:
             return {name: b.state for name, b in self._breakers.items()}
+
+    def all_breakers(self) -> dict[str, CircuitBreaker]:
+        """返回全部已创建熔断器的快照（只读用途）。"""
+        with self._lock:
+            return dict(self._breakers)
 
     def reset(self) -> None:
         with self._lock:

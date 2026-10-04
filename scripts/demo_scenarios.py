@@ -7,15 +7,23 @@
 1. 可重试失败后的安全重试成功；
 2. 非幂等 POST 无幂等键时拒绝重试；携带幂等键才重试；
 3. 熔断 关闭 -> 打开 -> 半开 -> 关闭 的时间窗口恢复；
-4. 并发同键请求只产生一次副作用，重复提交命中结果重放。
+4. 并发同键请求只产生一次副作用，重复提交命中结果重放；
+5. 单次转发总时间预算：重试等待计入预算，耗尽即降级且原因可区分；
+6. 按上游并发隔离：超限请求直接拒绝，不打上游、不计失败、不动幂等键；
+7. 只读运行指标：重试/降级/拒绝累计计数。
 
 运行时会打印状态迁移、重试决策与贯穿链路的 request_id 结构化日志。
 """
 from __future__ import annotations
 
+import sys
 import threading
+from pathlib import Path
 
-from app.config import CircuitBreakerConfig, RetryConfig
+# 允许从仓库根目录直接运行：uv run python scripts/demo_scenarios.py
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.config import BulkheadConfig, CircuitBreakerConfig, RetryConfig
 from app.errors import ErrorCategory
 from app.gateway import Conclusion, Gateway
 from app.upstream import (
@@ -172,11 +180,104 @@ def scenario_concurrent_same_key() -> None:
           f"上游副作用次数={client.calls}（仍为1，命中结果重放）")
 
 
+def scenario_budget_exhausted() -> None:
+    banner("场景5：总时间预算耗尽，重试等待也计入预算")
+    t = {"t": 0.0}
+
+    def sleeper(seconds: float) -> None:
+        t["t"] += seconds  # 假时钟：睡眠直接推进时间
+
+    client = StubUpstreamClient("orders")
+    client.set_script([fail(), fail(), ok()])
+    gw = Gateway(
+        {"orders": client},
+        breaker_config=CircuitBreakerConfig(failure_threshold=100),
+        retry_config=RetryConfig(
+            max_attempts=3, backoff_base_seconds=0.5, backoff_max_seconds=10.0
+        ),
+        clock=lambda: t["t"],
+        sleeper=sleeper,
+        rng=lambda: 1.0,
+    )
+    result = gw.handle(
+        "orders", UpstreamRequest("GET", "/orders/1"), budget_seconds=0.6
+    )
+    print(f"预算 0.6s: 结论={result.conclusion.value} 原因={result.reason} "
+          f"attempts={result.attempts} 上游调用={client.calls} 已耗时={t['t']}s")
+    assert result.conclusion is Conclusion.DEGRADED
+    assert result.reason == ErrorCategory.BUDGET_EXHAUSTED.value
+    assert client.calls == 2 and t["t"] == 0.6  # 第 3 次尝试未发生，且未超睡
+
+
+def scenario_bulkhead_rejection() -> None:
+    banner("场景6：按上游并发隔离，超限直接拒绝")
+    release = threading.Event()
+
+    class BlockingClient(StubUpstreamClient):
+        def call(self, request):
+            release.wait(timeout=5)
+            return super().call(request)
+
+    client = BlockingClient("orders")
+    gw = Gateway(
+        {"orders": client},
+        retry_config=RetryConfig(max_attempts=1),
+        bulkhead_config=BulkheadConfig(default_max_concurrent=2),
+        sleeper=lambda _s: None,
+    )
+    results: list = []
+    barrier = threading.Barrier(6)
+
+    def worker() -> None:
+        barrier.wait()
+        results.append(gw.handle("orders", UpstreamRequest("GET", "/orders/1")))
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for th in threads:
+        th.start()
+    import time
+
+    time.sleep(0.05)  # 等 2 个在途请求进入上游
+    release.set()
+    for th in threads:
+        th.join()
+
+    ok_n = len([r for r in results if r.conclusion is Conclusion.SUCCESS])
+    rej = [r for r in results if r.conclusion is Conclusion.REJECTED]
+    print(f"限 2 并发 6 请求: 成功={ok_n} 拒绝={len(rej)} 原因={rej[0].reason} "
+          f"上游调用={client.calls} 结束后在途={gw.bulkheads.in_flight('orders')}")
+    assert ok_n == 2 and len(rej) == 4 and client.calls == 2
+    assert rej[0].reason == ErrorCategory.CONCURRENCY_LIMIT_EXCEEDED.value
+    assert gw.bulkheads.in_flight("orders") == 0
+
+
+def scenario_metrics_snapshot() -> None:
+    banner("场景7：只读运行指标累计")
+    t = {"t": 0.0}
+    gw, client = build_gateway(
+        [fail(), fail(), ok(), fail(), fail(), fail(), fail()],
+        t,
+        failure_threshold=100,
+    )
+    gw.handle("orders", UpstreamRequest("GET", "/orders/1"))  # 2 次重试后成功
+    gw.handle("orders", UpstreamRequest("GET", "/orders/2"))  # 重试耗尽降级
+    gw.handle("orders", UpstreamRequest("POST", "/orders"))   # 非幂等无键拒绝
+    snap = gw.metrics.snapshot("orders")
+    breaker = gw.breakers.get("orders")
+    print(f"指标: retries={snap['retries']} degraded={snap['degraded']} "
+          f"rejected={snap['rejected']} 熔断器={breaker.state.value} "
+          f"窗口失败数={breaker.failure_count()}")
+    assert snap == {"retries": 4, "degraded": 1, "rejected": 1}
+
+
 def main() -> None:
     scenario_retry_then_success()
     scenario_non_idempotent_rules()
     scenario_circuit_recovery()
     scenario_concurrent_same_key()
+    scenario_budget_exhausted()
+    scenario_bulkhead_rejection()
+    scenario_metrics_snapshot()
     print("\n全部场景断言通过。")
 
 

@@ -34,7 +34,11 @@ _REJECT_STATUS = {
     ErrorCategory.IDEMPOTENCY_CONFLICT.value: 409,
     ErrorCategory.NON_IDEMPOTENT_RETRY_FORBIDDEN.value: 422,
     ErrorCategory.UPSTREAM_REJECTED.value: 502,
+    ErrorCategory.CONCURRENCY_LIMIT_EXCEEDED.value: 429,
 }
+
+# 调用方随请求携带的总时间预算（毫秒），可选；缺省表示不限制。
+BUDGET_HEADER = "X-Request-Budget-Ms"
 
 
 class CallBody(BaseModel):
@@ -87,10 +91,12 @@ def create_app() -> FastAPI:
     @app.post("/upstreams/{upstream}/call")
     async def call_upstream(upstream: str, call_body: CallBody, request: Request):
         idempotency_key = request.headers.get("Idempotency-Key")
+        budget_seconds = _parse_budget(request.headers.get(BUDGET_HEADER))
         result = gateway.handle(
             upstream,
             UpstreamRequest(call_body.method.upper(), call_body.path, call_body.body),
             idempotency_key=idempotency_key,
+            budget_seconds=budget_seconds,
         )
         body: dict[str, Any] = {
             "conclusion": result.conclusion.value,
@@ -129,4 +135,33 @@ def create_app() -> FastAPI:
     def circuit_states() -> dict[str, str]:
         return {name: state.value for name, state in gateway.breakers.all_states().items()}
 
+    @app.get("/admin/upstreams")
+    def upstream_stats() -> dict[str, Any]:
+        """只读运行状况：熔断状态、窗口内失败数、启动以来累计指标。"""
+        stats: dict[str, Any] = {}
+        for name, breaker in gateway.breakers.all_breakers().items():
+            counters = gateway.metrics.snapshot(name)
+            stats[name] = {
+                "breaker_state": breaker.state.value,
+                "window_failures": breaker.failure_count(),
+                "in_flight": gateway.bulkheads.in_flight(name),
+                "retries": counters["retries"],
+                "degraded": counters["degraded"],
+                "rejected": counters["rejected"],
+            }
+        return stats
+
     return app
+
+
+def _parse_budget(raw: str | None) -> float | None:
+    """解析预算请求头（毫秒）；缺省或非法值视为不限制。"""
+    if raw is None:
+        return None
+    try:
+        ms = float(raw)
+    except ValueError:
+        return None
+    if ms < 0:
+        return None
+    return ms / 1000.0
