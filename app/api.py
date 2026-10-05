@@ -32,6 +32,7 @@ gateway = Gateway({"stub": stub})
 
 _REJECT_STATUS = {
     ErrorCategory.IDEMPOTENCY_CONFLICT.value: 409,
+    ErrorCategory.CONCURRENCY_LIMIT_EXCEEDED.value: 429,
     ErrorCategory.NON_IDEMPOTENT_RETRY_FORBIDDEN.value: 422,
     ErrorCategory.UPSTREAM_REJECTED.value: 502,
 }
@@ -87,10 +88,30 @@ def create_app() -> FastAPI:
     @app.post("/upstreams/{upstream}/call")
     async def call_upstream(upstream: str, call_body: CallBody, request: Request):
         idempotency_key = request.headers.get("Idempotency-Key")
+        budget_seconds: float | None = None
+        budget_header = request.headers.get("X-Budget-Seconds")
+        if budget_header is not None:
+            try:
+                budget_seconds = float(budget_header)
+            except ValueError:
+                return JSONResponse(
+                    {
+                        "conclusion": "rejected",
+                        "upstream": upstream,
+                        "attempts": 0,
+                        "request_id": None,
+                        "error": {
+                            "category": "invalid_budget_header",
+                            "message": "X-Budget-Seconds header must be a number",
+                        },
+                    },
+                    status_code=422,
+                )
         result = gateway.handle(
             upstream,
             UpstreamRequest(call_body.method.upper(), call_body.path, call_body.body),
             idempotency_key=idempotency_key,
+            budget_seconds=budget_seconds,
         )
         body: dict[str, Any] = {
             "conclusion": result.conclusion.value,
@@ -128,5 +149,10 @@ def create_app() -> FastAPI:
     @app.get("/admin/circuits")
     def circuit_states() -> dict[str, str]:
         return {name: state.value for name, state in gateway.breakers.all_states().items()}
+
+    @app.get("/admin/status")
+    def status_snapshot() -> dict[str, dict[str, Any]]:
+        # 只读运行状况：熔断状态、窗口失败数、在途数与启动以来累计指标。
+        return gateway.status_snapshot()
 
     return app

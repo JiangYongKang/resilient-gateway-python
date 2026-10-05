@@ -62,6 +62,12 @@ class CircuitBreaker:
             self._maybe_advance()
             return self._state
 
+    def failure_count_in_window(self) -> int:
+        """当前失败窗口内累计的失败数（只读视图，供状态查看）。"""
+        with self._lock:
+            self._prune_failures()
+            return len(self._failure_times)
+
     def allow_request(self) -> bool:
         """是否允许一个请求通过熔断器。
 

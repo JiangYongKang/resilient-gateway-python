@@ -16,8 +16,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
-from app.breaker import BreakerRegistry, BreakerState
-from app.config import CircuitBreakerConfig, RetryConfig
+from app.breaker import BreakerRegistry, BreakerState, CircuitBreaker
+from app.budget import Deadline
+from app.bulkhead import BulkheadRegistry
+from app.config import (
+    BudgetConfig,
+    BulkheadConfig,
+    CircuitBreakerConfig,
+    RetryConfig,
+)
 from app.context import bind_context, log_event, new_context
 from app.errors import (
     ErrorCategory,
@@ -25,6 +32,7 @@ from app.errors import (
     normalize_outcome_failure,
 )
 from app.idempotency import DedupStatus, IdempotencyStore
+from app.metrics import MetricsRegistry
 from app.retry import (
     compute_backoff_seconds,
     is_retryable_outcome,
@@ -63,7 +71,10 @@ class Gateway:
         clients: dict[str, UpstreamClient],
         breaker_config: CircuitBreakerConfig | None = None,
         retry_config: RetryConfig | None = None,
+        budget_config: BudgetConfig | None = None,
+        bulkhead_config: BulkheadConfig | None = None,
         idempotency_store: IdempotencyStore | None = None,
+        metrics: MetricsRegistry | None = None,
         degraded_payload_factory: Callable[[str], object] = default_degraded_payload,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
@@ -73,6 +84,10 @@ class Gateway:
         self.breaker_config = breaker_config or CircuitBreakerConfig()
         self.breakers = BreakerRegistry(self.breaker_config, clock=clock)
         self.retry_config = retry_config or RetryConfig()
+        self.budget_config = budget_config or BudgetConfig()
+        self.bulkheads = BulkheadRegistry(bulkhead_config or BulkheadConfig())
+        self.metrics = metrics or MetricsRegistry()
+        self._clock = clock
         self.idempotency = idempotency_store or IdempotencyStore()
         self._make_degraded_payload = degraded_payload_factory
         self._sleeper = sleeper
@@ -83,10 +98,34 @@ class Gateway:
         upstream: str,
         request: UpstreamRequest,
         idempotency_key: str | None = None,
+        budget_seconds: float | None = None,
     ) -> GatewayResult:
         ctx = new_context()
         with bind_context(ctx):
-            return self._handle(upstream, request, idempotency_key, ctx.request_id)
+            return self._handle(upstream, request, idempotency_key, budget_seconds, ctx.request_id)
+
+    def status_snapshot(self) -> dict[str, dict[str, object]]:
+        """只读运行状况视图：按上游返回熔断状态、窗口失败数与启动以来累计指标。
+
+        纯读取，不改变任何熔断/幂等/并发隔离状态。
+        """
+        metrics = self.metrics.snapshot()
+        names = set(self.clients) | set(metrics)
+        snapshot: dict[str, dict[str, object]] = {}
+        for name in sorted(names):
+            breaker = self.breakers.get(name)
+            counters = metrics.get(
+                name, {"retries": 0, "degraded": 0, "rejected": 0}
+            )
+            snapshot[name] = {
+                "breaker_state": breaker.state.value,
+                "window_failures": breaker.failure_count_in_window(),
+                "in_flight": self.bulkheads.in_flight(name),
+                "retries": counters["retries"],
+                "degraded": counters["degraded"],
+                "rejected": counters["rejected"],
+            }
+        return snapshot
 
     # ------------------------------------------------------------------
 
@@ -95,6 +134,7 @@ class Gateway:
         upstream: str,
         request: UpstreamRequest,
         idempotency_key: str | None,
+        budget_seconds: float | None,
         request_id: str,
     ) -> GatewayResult:
         client = self.clients.get(upstream)
@@ -106,6 +146,13 @@ class Gateway:
             )
 
         breaker = self.breakers.get(upstream)
+        # 单次请求的总时间预算：从进入网关起算，退避等待也计入；
+        # 未携带预算且未配置默认预算时为 None（不限），行为与既有版本一致。
+        effective_budget = (
+            budget_seconds if budget_seconds is not None
+            else self.budget_config.default_seconds
+        )
+        deadline = Deadline(effective_budget, self._clock)
         log_event(
             "request_start",
             upstream=upstream,
@@ -115,6 +162,47 @@ class Gateway:
             breaker_state=breaker.state.value,
         )
 
+        # 0) 并发隔离：超限请求在幂等/熔断/上游调用之前被确定性拒绝，
+        #    不计入上游失败统计，也不触碰处理中的幂等键。
+        permit = self.bulkheads.try_acquire(upstream)
+        if permit is None:
+            log_event("request_rejected", reason="concurrency_limit_exceeded")
+            self.metrics.record_rejected(upstream)
+            return GatewayResult(
+                Conclusion.REJECTED,
+                upstream,
+                attempts=0,
+                reason=ErrorCategory.CONCURRENCY_LIMIT_EXCEEDED.value,
+                request_id=request_id,
+            )
+        try:
+            result = self._handle_inner(
+                upstream,
+                request,
+                client,
+                breaker,
+                idempotency_key,
+                deadline,
+                request_id,
+            )
+        finally:
+            permit.release()
+        if result.conclusion is Conclusion.DEGRADED:
+            self.metrics.record_degraded(upstream)
+        elif result.conclusion is Conclusion.REJECTED:
+            self.metrics.record_rejected(upstream)
+        return result
+
+    def _handle_inner(
+        self,
+        upstream: str,
+        request: UpstreamRequest,
+        client: UpstreamClient,
+        breaker: CircuitBreaker,
+        idempotency_key: str | None,
+        deadline: Deadline,
+        request_id: str,
+    ) -> GatewayResult:
         # 1) 幂等键处理：并发同键拒绝；已完成同键直接重放。
         if idempotency_key is not None:
             dedup = self.idempotency.acquire(idempotency_key)
@@ -155,6 +243,20 @@ class Gateway:
         last_category: ErrorCategory | None = None
 
         while attempts < self.retry_config.max_attempts:
+            # 预算耗尽：不再触达上游，直接给出确定的降级结论。
+            if deadline.expired():
+                log_event(
+                    "request_budget_exhausted",
+                    reason="budget_exhausted_before_attempt",
+                    attempts=attempts,
+                )
+                return self._degraded_result(
+                    upstream,
+                    request_id,
+                    ErrorCategory.BUDGET_EXHAUSTED.value,
+                    idempotency_key,
+                    attempts=attempts,
+                )
             attempts += 1
             try:
                 response = client.call(request)
@@ -170,7 +272,10 @@ class Gateway:
                     attempts, UpstreamOutcome.RETRYABLE_FAILURE, can_retry
                 ):
                     break
-                self._wait_before_retry(attempts)
+                if not self._wait_before_retry(upstream, attempts, deadline):
+                    return self._budget_exhausted_result(
+                        upstream, request_id, idempotency_key, attempts
+                    )
                 continue
 
             outcome = response.outcome
@@ -206,7 +311,10 @@ class Gateway:
 
             if not self._should_retry(attempts, outcome, can_retry):
                 break
-            self._wait_before_retry(attempts)
+            if not self._wait_before_retry(upstream, attempts, deadline):
+                return self._budget_exhausted_result(
+                    upstream, request_id, idempotency_key, attempts
+                )
 
         # 4) 重试循环结束仍未成功。失败不占用幂等键，允许凭同键安全重提。
         if idempotency_key is not None:
@@ -272,10 +380,43 @@ class Gateway:
         )
         return decision
 
-    def _wait_before_retry(self, attempts: int) -> None:
+    def _wait_before_retry(
+        self, upstream: str, attempts: int, deadline: Deadline
+    ) -> bool:
+        """退避等待；若等待本身会耗尽预算则不等待并返回 False。"""
         delay = compute_backoff_seconds(attempts, self.retry_config, self._rng)
+        if not deadline.fits(delay):
+            log_event(
+                "retry_backoff_skipped",
+                attempts=attempts,
+                delay_seconds=delay,
+                reason="budget_exhausted",
+            )
+            return False
         log_event("retry_backoff", attempts=attempts, delay_seconds=delay)
+        self.metrics.record_retry(upstream)
         self._sleeper(delay)
+        return True
+
+    def _budget_exhausted_result(
+        self,
+        upstream: str,
+        request_id: str,
+        idempotency_key: str | None,
+        attempts: int,
+    ) -> GatewayResult:
+        log_event(
+            "request_budget_exhausted",
+            reason="backoff_exceeds_budget",
+            attempts=attempts,
+        )
+        return self._degraded_result(
+            upstream,
+            request_id,
+            ErrorCategory.BUDGET_EXHAUSTED.value,
+            idempotency_key,
+            attempts=attempts,
+        )
 
     def _degraded_result(
         self,

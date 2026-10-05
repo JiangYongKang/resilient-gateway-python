@@ -1,7 +1,7 @@
 """韧性策略可配置项（仅数据定义）。"""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -21,3 +21,19 @@ class RetryConfig:
     max_attempts: int = 3
     backoff_base_seconds: float = 0.01
     backoff_max_seconds: float = 1.0
+
+
+@dataclass(frozen=True)
+class BudgetConfig:
+    # 调用方未随请求携带预算时使用的默认总预算秒数；
+    # None 表示不限预算（默认，保持既有行为不变）。
+    default_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class BulkheadConfig:
+    # 每个上游默认允许的最大在途请求数；
+    # None 表示不限制（默认，保持既有行为不变）。
+    default_max_in_flight: int | None = None
+    # 按上游名覆盖默认值的配置。
+    per_upstream: dict[str, int] = field(default_factory=dict)

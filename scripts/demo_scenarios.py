@@ -7,15 +7,22 @@
 1. 可重试失败后的安全重试成功；
 2. 非幂等 POST 无幂等键时拒绝重试；携带幂等键才重试；
 3. 熔断 关闭 -> 打开 -> 半开 -> 关闭 的时间窗口恢复；
-4. 并发同键请求只产生一次副作用，重复提交命中结果重放。
+4. 并发同键请求只产生一次副作用，重复提交命中结果重放；
+5. 单次请求总预算耗尽即确定性降级，不再触达上游；
+6. 按上游并发隔离：超限请求确定性拒绝，不计失败统计；
+7. 只读状态视图：熔断状态、窗口失败数与启动以来累计指标。
 
 运行时会打印状态迁移、重试决策与贯穿链路的 request_id 结构化日志。
 """
 from __future__ import annotations
 
+import sys
 import threading
+from pathlib import Path
 
-from app.config import CircuitBreakerConfig, RetryConfig
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from app.config import BulkheadConfig, CircuitBreakerConfig, RetryConfig
 from app.errors import ErrorCategory
 from app.gateway import Conclusion, Gateway
 from app.upstream import (
@@ -172,11 +179,110 @@ def scenario_concurrent_same_key() -> None:
           f"上游副作用次数={client.calls}（仍为1，命中结果重放）")
 
 
+def scenario_budget_exhausted() -> None:
+    banner("场景5：单次请求总预算耗尽即确定性降级")
+    t = {"t": 0.0}
+    # 退避基数 1s：第一次失败后需等 1s 再重试，但预算只有 0.5s。
+    client = StubUpstreamClient("orders")
+    client.set_script([fail(), ok()])
+
+    def sleeper(seconds: float) -> None:
+        t["t"] += seconds
+
+    gw = Gateway(
+        {"orders": client},
+        breaker_config=CircuitBreakerConfig(failure_threshold=100),
+        retry_config=RetryConfig(max_attempts=3, backoff_base_seconds=1.0),
+        clock=lambda: t["t"],
+        sleeper=sleeper,
+        rng=lambda: 1.0,
+    )
+    req = UpstreamRequest("GET", "/orders/1")
+    exhausted = gw.handle("orders", req, budget_seconds=0.5)
+    print(f"预算 0.5s（退避需 1s）: 结论={exhausted.conclusion.value} 原因={exhausted.reason} "
+          f"attempts={exhausted.attempts} 上游调用次数={client.calls}")
+    assert exhausted.conclusion is Conclusion.DEGRADED
+    assert exhausted.reason == ErrorCategory.BUDGET_EXHAUSTED.value
+    assert client.calls == 1  # 预算耗尽，不再打上游
+
+    enough = gw.handle("orders", req, budget_seconds=10.0)
+    print(f"预算 10s: 结论={enough.conclusion.value} attempts={enough.attempts} "
+          f"上游调用次数={client.calls}")
+    assert enough.conclusion is Conclusion.SUCCESS
+
+
+def scenario_concurrency_isolation() -> None:
+    banner("场景6：按上游并发隔离，超限确定性拒绝")
+    release = threading.Event()
+    entered = threading.Event()
+
+    class BlockingClient(StubUpstreamClient):
+        def call(self, request):
+            entered.set()
+            release.wait(timeout=5)
+            return super().call(request)
+
+    client = BlockingClient("orders")
+    gw = Gateway(
+        {"orders": client},
+        breaker_config=CircuitBreakerConfig(failure_threshold=100),
+        retry_config=RetryConfig(max_attempts=1),
+        bulkhead_config=BulkheadConfig(default_max_in_flight=1),
+        sleeper=lambda _s: None,
+    )
+    first: list = []
+    holder = threading.Thread(
+        target=lambda: first.append(gw.handle("orders", UpstreamRequest("GET", "/orders/1")))
+    )
+    holder.start()
+    assert entered.wait(timeout=5)
+
+    rejected = gw.handle("orders", UpstreamRequest("GET", "/orders/1"))
+    breaker = gw.breakers.get("orders")
+    print(f"在途 1/1 时再发请求: 结论={rejected.conclusion.value} 原因={rejected.reason} "
+          f"熔断窗口失败数={breaker.failure_count_in_window()}（不计入失败统计）")
+    assert rejected.conclusion is Conclusion.REJECTED
+    assert rejected.reason == ErrorCategory.CONCURRENCY_LIMIT_EXCEEDED.value
+    assert breaker.failure_count_in_window() == 0
+
+    release.set()
+    holder.join()
+    print(f"首个请求结束后: 结论={first[0].conclusion.value} 在途数={gw.bulkheads.in_flight('orders')}")
+    assert first[0].conclusion is Conclusion.SUCCESS
+    assert gw.bulkheads.in_flight("orders") == 0
+
+
+def scenario_status_snapshot() -> None:
+    banner("场景7：只读状态视图（熔断状态/窗口失败数/累计指标）")
+    t = {"t": 0.0}
+    gw, client = build_gateway(
+        [fail(), ok(), fail(), fail(), fail(), fail()], t, failure_threshold=100
+    )
+    req = UpstreamRequest("GET", "/orders/1")
+    gw.handle("orders", req)                                   # 重试 1 次后成功
+    degraded = gw.handle("orders", req)                        # 重试耗尽降级
+    rejected = gw.handle("orders", UpstreamRequest("POST", "/orders"))  # 无键拒绝
+    assert degraded.conclusion is Conclusion.DEGRADED
+    assert rejected.conclusion is Conclusion.REJECTED
+
+    snapshot = gw.status_snapshot()["orders"]
+    print(f"status_snapshot: {snapshot}")
+    assert snapshot["breaker_state"] == "closed"
+    assert snapshot["window_failures"] == 5  # 1 + 3 + 1 次失败
+    assert snapshot["retries"] == 3          # 1 + 2 次实际重试
+    assert snapshot["degraded"] == 1
+    assert snapshot["rejected"] == 1
+    print("对应 HTTP 只读入口：GET /admin/status")
+
+
 def main() -> None:
     scenario_retry_then_success()
     scenario_non_idempotent_rules()
     scenario_circuit_recovery()
     scenario_concurrent_same_key()
+    scenario_budget_exhausted()
+    scenario_concurrency_isolation()
+    scenario_status_snapshot()
     print("\n全部场景断言通过。")
 
 
